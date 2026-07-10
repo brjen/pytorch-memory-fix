@@ -136,6 +136,8 @@ libc.mallopt(-1, 65536)   # M_TRIM_THRESHOLD
 # arenas that already fragmented stay fragmented.
 ```
 
+Treat `mallopt` as the fallback, not the preference: it can't defragment a heap that already grew, so call it before any model loads — and set the env at launch whenever you control the launcher.
+
 ### Verify it's actually active
 
 Don't trust that it took — check from inside the process:
@@ -145,6 +147,18 @@ python verify_fix.py          # in your launch environment
 ```
 
 It allocates 50 blocks sized between the fixed threshold (64KB) and glibc's default (128KB) and counts how many went to mmap via `mallinfo2`. **+45 or more → fix active. ~0 → you're still on the heap arena** (the usual cause: env vars set after process start).
+
+### The biggest deployment gotcha: spawned workers
+
+If your server spawns worker processes — `multiprocessing`, `subprocess`, Node `child_process.spawn`, Ray workers, a queue dispatcher launching renderers — **the workers only get the fix if it's in the parent process's environment** (children inherit env at spawn), or if it's passed explicitly into each spawn's `env`. A config file that only the parent reads, or a launch wrapper the children bypass, silently misses the workers: the server looks "deployed" while every process doing the actual model loading runs unprotected. This is the most common real-world failure shape — we hit it ourselves months after shipping the fix, when a video runner spawned by a server whose own env lacked the vars crept all night and stalled a heavy render into swap, with the vars sitting right there in three config files.
+
+Verify against the running process, not the config:
+
+```bash
+tr '\0' '\n' < /proc/<worker-pid>/environ | grep MALLOC_
+```
+
+If that's empty, the worker isn't protected no matter what your config says — and `python verify_fix.py` (or calling `verify_fix.fix_is_active()` inside the worker) settles it behaviorally.
 
 ## What It Affects
 
@@ -169,6 +183,7 @@ If you're tempted by allocator replacement instead (jemalloc/tcmalloc via `LD_PR
 - **`MALLOC_MMAP_MAX_`** — glibc caps live mmap'd allocations at 65,536 by default; beyond that it silently falls back to the heap. Model serving never gets close, but allocation-heavy processes can raise it: `MALLOC_MMAP_MAX_=1048576`.
 - **Modern interface** — on current glibc these knobs are also exposed as tunables: `GLIBC_TUNABLES=glibc.malloc.mmap_threshold=65536:glibc.malloc.trim_threshold=65536`. Same effect; use whichever fits your deploy tooling.
 - **Secure binaries** — `MALLOC_*` env vars are ignored in setuid/setgid (secure) processes. Not a concern for normal Python, but it's the kind of thing that makes a fix "mysteriously not work" in exotic setups.
+- **Don't stack `MALLOC_ARENA_MAX=1` on top** — it shows up in memory-tuning threads as an extra saving, but it funnels every thread through a single arena lock and can serialize a multi-threaded server. The two thresholds here don't touch arena count; keep it that way unless you've measured.
 - **glibc only** — musl (Alpine) and jemalloc/tcmalloc-linked builds have different allocators and different behavior; this fix is specifically for the default glibc `ptmalloc`.
 
 ## Why Nobody Talks About This
