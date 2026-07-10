@@ -158,7 +158,7 @@ Verify against the running process, not the config:
 tr '\0' '\n' < /proc/<worker-pid>/environ | grep MALLOC_
 ```
 
-If that's empty, the worker isn't protected no matter what your config says — and `python verify_fix.py` (or calling `verify_fix.fix_is_active()` inside the worker) settles it behaviorally.
+If that's empty, the workers didn't inherit it: set the vars on the **parent process's** environment (or pass them into each spawn's `env` explicitly) — a config file the parent merely *reads* is not inherited by anything. Then re-check, and let `python verify_fix.py` (or `verify_fix.fix_is_active()` inside the worker) settle it behaviorally.
 
 ## What It Affects
 
