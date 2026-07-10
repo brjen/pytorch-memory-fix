@@ -30,9 +30,13 @@ parser.add_argument("--cycles", type=int, default=10, help="Number of load/unloa
 parser.add_argument("--model", default="auto", help="Model to test: auto, bert, gpt2, resnet (default: auto)")
 args = parser.parse_args()
 
-if not args.no_fix:
-    os.environ['MALLOC_MMAP_THRESHOLD_'] = '65536'
-    os.environ['MALLOC_TRIM_THRESHOLD_'] = '65536'
+# NOTE: setting os.environ here would NOT work — glibc reads MALLOC_* once, at
+# allocator init, before Python code runs. So when the fix is requested and the
+# env isn't already present, we re-exec this script with the env genuinely set
+# at process launch. (See verify_fix.py to confirm which mode a process is in.)
+if not args.no_fix and os.environ.get('MALLOC_MMAP_THRESHOLD_') != '65536':
+    env = dict(os.environ, MALLOC_MMAP_THRESHOLD_='65536', MALLOC_TRIM_THRESHOLD_='65536')
+    os.execve(sys.executable, [sys.executable] + sys.argv, env)
 
 import torch
 

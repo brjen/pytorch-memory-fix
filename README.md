@@ -35,7 +35,7 @@ None of these fix the root cause.
 
 When Python/PyTorch allocates memory for model weights (typically 2-30GB), glibc's default allocator uses `sbrk()` to extend the heap. This memory is allocated in **arenas** — contiguous chunks that the allocator manages internally.
 
-The critical behavior: **glibc's heap arenas never shrink back to their original size.** When you `free()` the memory, it's marked as available within the arena, but the arena's address space is not returned to the operating system. `malloc_trim()` can return some pages, but only fully empty ones at the end of the arena. Fragmented pages in the middle are stuck.
+The critical behavior: **glibc's heap arenas never shrink back to their original size.** When you `free()` the memory, it's marked as available within the arena, but the arena's address space is not returned to the operating system. `malloc_trim()` helps less than you'd hope: since glibc 2.8 it can release whole free pages anywhere in the heap (not just the top), but any page still containing even one small live allocation cannot be released — and Python interleaves small long-lived allocations everywhere. The fragmented arena survives every trim.
 
 Each model load/unload cycle fragments the arena slightly differently. Over hundreds of cycles, the arena grows permanently. The memory isn't leaked — glibc knows it's free — but the OS can't reclaim it because the heap boundary never moves back.
 
@@ -121,14 +121,30 @@ ENV MALLOC_TRIM_THRESHOLD_=65536
 MALLOC_MMAP_THRESHOLD_=65536 MALLOC_TRIM_THRESHOLD_=65536 python model_server.py
 ```
 
-### Python (before any large allocations)
+### From inside a running process (ComfyUI, notebooks, plugins)
+
+**⚠️ Setting `os.environ` inside Python does NOT work** — glibc reads the `MALLOC_*` variables once, at allocator initialization, which happens during interpreter startup, *before your first line of Python runs*. By the time `os.environ[...] = ...` executes, the allocator is already configured; the assignment only affects child processes. (We verified this empirically — see [`verify_fix.py`](verify_fix.py): 50×100KB mallocs go +49 to mmap with the env set at launch, +0 with `os.environ` set in-process.)
+
+If you can't control the launch environment, use `mallopt` — it works at runtime:
 
 ```python
-import os
-os.environ['MALLOC_MMAP_THRESHOLD_'] = '65536'
-os.environ['MALLOC_TRIM_THRESHOLD_'] = '65536'
-# Must be set before PyTorch/transformers imports
+import ctypes
+libc = ctypes.CDLL("libc.so.6")
+libc.mallopt(-3, 65536)   # M_MMAP_THRESHOLD
+libc.mallopt(-1, 65536)   # M_TRIM_THRESHOLD
+# Call as early as possible: it only affects NEW allocations —
+# arenas that already fragmented stay fragmented.
 ```
+
+### Verify it's actually active
+
+Don't trust that it took — check from inside the process:
+
+```bash
+python verify_fix.py          # in your launch environment
+```
+
+It allocates 50 blocks sized between the fixed threshold (64KB) and glibc's default (128KB) and counts how many went to mmap via `mallinfo2`. **+45 or more → fix active. ~0 → you're still on the heap arena** (the usual cause: env vars set after process start).
 
 ## What It Affects
 
@@ -139,11 +155,21 @@ os.environ['MALLOC_TRIM_THRESHOLD_'] = '65536'
 
 ## Performance Impact
 
-We measured zero impact on render times:
-- SDXL render: 5,296ms (vs ~5,300ms without fix)
-- Flux render: 10,983ms (vs ~9,600ms without fix — within normal variance)
+No measurable impact on our workloads — model serving and render pipelines, where allocations are large and infrequent. SDXL renders measured 5,296ms vs ~5,300ms without the fix; after three-plus months in production across five architectures (including our heaviest CPU-dequant lanes), render-time telemetry shows no regression attributable to the allocator change.
 
-Model load times are marginally affected because mmap has slightly more syscall overhead than sbrk, but the difference is unmeasurable against multi-second load times.
+Two honest caveats:
+
+1. **This pins the threshold and disables glibc's dynamic adaptation.** By default, glibc *raises* the mmap threshold (up to 32MB) when it sees large blocks freed — that's its defense against mmap churn. Workloads that allocate and free large buffers in a tight loop (not model serving — think per-iteration CPU tensor churn) pay mmap/munmap syscalls plus kernel page-zeroing on every cycle. Measure on your hottest path before shipping; for load-render-unload patterns it's a non-issue.
+2. Model load times are marginally affected because mmap has slightly more syscall overhead than sbrk, but the difference is unmeasurable against multi-second load times.
+
+If you're tempted by allocator replacement instead (jemalloc/tcmalloc via `LD_PRELOAD`): we measured jemalloc regressing heavy CPU-dequantization render lanes 5–10× on this same workload class. The env-var route gets the RAM back without touching hot-path performance.
+
+## Fine Print
+
+- **`MALLOC_MMAP_MAX_`** — glibc caps live mmap'd allocations at 65,536 by default; beyond that it silently falls back to the heap. Model serving never gets close, but allocation-heavy processes can raise it: `MALLOC_MMAP_MAX_=1048576`.
+- **Modern interface** — on current glibc these knobs are also exposed as tunables: `GLIBC_TUNABLES=glibc.malloc.mmap_threshold=65536:glibc.malloc.trim_threshold=65536`. Same effect; use whichever fits your deploy tooling.
+- **Secure binaries** — `MALLOC_*` env vars are ignored in setuid/setgid (secure) processes. Not a concern for normal Python, but it's the kind of thing that makes a fix "mysteriously not work" in exotic setups.
+- **glibc only** — musl (Alpine) and jemalloc/tcmalloc-linked builds have different allocators and different behavior; this fix is specifically for the default glibc `ptmalloc`.
 
 ## Why Nobody Talks About This
 
@@ -166,6 +192,30 @@ The data showed:
 
 Once we identified that the memory was in glibc's arena (not Python, not PyTorch, not the GPU), the fix was straightforward: force allocations through mmap where the OS can reclaim them.
 
+## Production Data: 74 Days, 6,000 Cycles, 5,357 Model Switches
+
+Since the original 189-render matrix, the fix has run 24/7 in our production render pipeline with full memory telemetry (every load, unload, and settled-RSS sample recorded to SQLite). The longitudinal picture, 2026-04-27 → 2026-07-09:
+
+| Metric | Value |
+|---|---|
+| Load/unload cycles (classic load→render→unload worker) | 6,017 |
+| Model switches (consecutive loads of *different* checkpoints) | 5,357 |
+| Distinct checkpoints | 40 |
+| Distinct architectures | 19 (SDXL, Flux, PixArt, Qwen-Image, HiDream, Wan 2.2 video, …) |
+| Largest single model load | +47.9GB RSS (Qwen-Image, bf16) |
+| **Median settled post-unload RSS, by month** | **Apr: 1,786MB · May: 1,777MB · Jun: 1,193MB** |
+| OOM kills attributable to allocator creep | **0** |
+
+The number that matters is the monthly median settled RSS: **flat-to-declining across 74 days** of continuous model switching. Without the fix, the same pipeline gained ~450MB per switch and OOM'd in 17 hours — at that rate, 5,357 switches is ~2.4TB of phantom RSS. With it, representative long single-process sessions:
+
+| Session | Cycles | Distinct models | Settled RSS drift (first→last) |
+|---|---|---|---|
+| 2026-06-13 | 101 | 22 | **+53MB** (~0.5MB/cycle) |
+| 2026-06-08 | 121 | 20 | −458MB (ended *below* start) |
+| 2026-06-07 | 198 | 19 | +442MB (~2MB/cycle) |
+
+Residual single-digit-MB/cycle drift in some long sessions traces to non-allocator sources (driver/context growth, module caches, and lanes that deliberately keep warm residents — e.g. pinned text encoders — which raise the floor *by design*). The allocator-creep signature — hundreds of MB per switch, unbounded — is gone everywhere, for months.
+
 ## Run the Benchmark Yourself
 
 ```bash
@@ -184,8 +234,8 @@ See [`benchmark.py`](benchmark.py) for the full test harness.
 
 ## Hardware Tested On
 
-- **Server**: 62GB RAM, AMD RX 7800 XT (16GB VRAM), Ubuntu Linux
-- **Models**: 13 checkpoints across 5 architectures (SDXL, Flux, PixArt-Sigma, Playground V2.5, Kandinsky 3)
+- **Server**: 62GB RAM, AMD RX 7800 XT (16GB VRAM), Linux/glibc (originally tested on glibc 2.39, currently running glibc 2.43 on an Arch-based distro)
+- **Models**: originally 13 checkpoints across 5 architectures (SDXL, Flux, PixArt-Sigma, Playground V2.5, Kandinsky 3); now 40 checkpoints across 19 architectures in production
 - **Workload**: Continuous model switching — load model A, render, unload, load model B, render, unload, repeat
 - **Test matrix**: 189 renders across every switching pattern, plus a 104-render long-run proof (107 model switches, RSS flat)
 
@@ -193,7 +243,7 @@ See [`benchmark.py`](benchmark.py) for the full test harness.
 
 This fix is running in production 24/7. We are actively monitoring for regressions and will update this repo with any findings.
 
-**Verified stable as of 2026-03-24** — zero RSS drift after 107 consecutive model switches across all 5 architectures.
+**Verified stable as of 2026-07-09** — after the original 107-switch proof, the fix has now survived 74 days of 24/7 production: 6,000+ load/unload cycles and 5,357 model switches across 19 architectures with flat monthly median settled RSS (see Production Data above).
 
 If you encounter any regressions or edge cases, please [open an issue](https://github.com/brjen/pytorch-memory-fix/issues).
 
